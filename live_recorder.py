@@ -23,25 +23,32 @@ from streamlink_cli.main import open_stream
 from streamlink_cli.output import FileOutput
 from streamlink_cli.streamrunner import StreamRunner
 
-recording: Dict[str, Tuple[StreamIO, FileOutput]] = {}
+import liquid,pytz
+from datetime import datetime
 
+recording: Dict[str, Tuple[StreamIO, FileOutput]] = {}
 
 class LiveRecoder:
     def __init__(self, config: dict, user: dict):
         self.id = user['id']
         platform = user['platform']
-        name = user.get('name', self.id)
-        self.flag = f'[{platform}][{name}]'
+        self.name = user.get('name', self.id)
+        self.flag = f'[{platform}][{self.name}]'
 
         self.interval = user.get('interval', 10)
         self.headers = user.get('headers', {'User-Agent': 'Chrome'})
         self.cookies = user.get('cookies')
-        self.format = user.get('format')
+        self.format = user.get('format', 'flv')
         self.proxy = user.get('proxy', config.get('proxy'))
         self.output = user.get('output', config.get('output', 'output'))
 
         self.get_cookies()
         self.client = self.get_client()
+
+        # liquid过滤器
+        self.env = liquid.Environment()
+        self.env.add_filter('time_zone', self.time_zone)
+        self.env.add_filter('format_date', self.format_date)
 
     async def start(self):
         logger.info(f'{self.flag}正在检测直播状态')
@@ -93,8 +100,27 @@ class LiveRecoder:
             cookies.load(self.cookies)
             self.cookies = {k: v.value for k, v in cookies.items()}
 
+    # 时区
+    def time_zone(self, value, tz_name):
+        tz = pytz.timezone(tz_name)
+        if isinstance(value, (int, float)):
+            value = datetime.fromtimestamp(value, tz)
+        elif isinstance(value, datetime):
+            value = value.astimezone(tz)
+        else:
+            raise TypeError(f"Unsupported type for time_zone filter: {type(value)}")
+        return value
+
+    # 时间格式
+    def format_date(self, value, date_format):
+        if isinstance(value, datetime):
+            return value.strftime(date_format)[:-3]
+        raise TypeError(f"Unsupported type for format_date filter: {type(value)}")
+
     def get_filename(self, title, format):
+        title = title or "title"
         live_time = time.strftime('%Y.%m.%d %H.%M.%S')
+
         # 文件名特殊字符转换为全角字符
         char_dict = {
             '"': '＂',
@@ -109,8 +135,45 @@ class LiveRecoder:
         }
         for half, full in char_dict.items():
             title = title.replace(half, full)
-        filename = f'[{live_time}]{self.flag}{title[:50]}.{format}'
-        return filename
+
+        # 模板参数
+        context = {
+            "platform": self.flag,
+            "id": self.id,
+            "name": self.name,
+            "title": title,
+            "format": format,
+            "now": datetime.now()
+        }
+
+        # 如果没有配置文件名模板则使用默认模板
+        if format not in self.output:
+            filename = f'[{live_time}]{self.flag}{title[:50]}.{format}'
+            directory = self.output
+        else:
+            template = self.env.from_string(self.output)
+            rendered_output = template.render(context)
+
+            if "{{" in rendered_output or "}}" in rendered_output:
+                raise ValueError(f"路径中存在未解析的模板变量: {rendered_output}")
+
+            directory, filename = os.path.split(rendered_output)
+
+            # 默认输出路径
+            if not directory:
+                directory = "output"
+
+        directory = self.env.from_string(directory).render(context)
+        filename = self.env.from_string(filename).render(context)
+
+        # 确保目录存在
+        try:
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+        except OSError as error:
+            raise OSError(f"路径创建失败: {directory}\n{error}")
+        return os.path.join(directory, filename)
+
 
     def get_streamlink(self):
         session = streamlink.session.Streamlink({
@@ -146,7 +209,7 @@ class LiveRecoder:
 
     def stream_writer(self, stream, url, filename):
         logger.info(f'{self.flag}获取到直播流链接：{filename}\n{stream.url}')
-        output = FileOutput(Path(f'{self.output}/{filename}'))
+        output = FileOutput(Path(filename))
         try:
             stream_fd, prebuffer = open_stream(stream)
             output.open()
