@@ -227,17 +227,18 @@ class LiveRecoder:
         finally:
             output.close()
 
-    def run_ffmpeg(self, filename, format):
-        logger.info(f'{self.flag}开始ffmpeg封装：{filename}')
-        new_filename = filename.replace(f'.{format}', f'.{self.format}')
-        ffmpeg.input(f'{self.output}/{filename}').output(
-            f'{self.output}/{new_filename}',
-            codec='copy',
-            map_metadata='-1',
-            movflags='faststart'
-        ).global_args('-hide_banner').run()
-        os.remove(f'{self.output}/{filename}')
-
+def run_ffmpeg(self, filename, format):
+    logger.info(f'{self.flag}开始ffmpeg封装：{filename}')
+    directory, file_basename = os.path.split(filename)
+    new_basename = file_basename.replace(f'.{format}', f'.{self.format}')
+    new_filename = os.path.join(directory, new_basename)
+    ffmpeg.input(filename).output(
+        new_filename,
+        codec='copy',
+        map_metadata='-1',
+        movflags='faststart'
+    ).global_args('-hide_banner').run()
+    os.remove(filename)
 
 class Bilibili(LiveRecoder):
     async def run(self):
