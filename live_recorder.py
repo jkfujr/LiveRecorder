@@ -25,6 +25,7 @@ from streamlink_cli.streamrunner import StreamRunner
 
 import liquid,pytz
 from datetime import datetime
+import sys
 
 recording: Dict[str, Tuple[StreamIO, FileOutput]] = {}
 
@@ -35,7 +36,7 @@ class LiveRecoder:
         self.name = user.get('name', self.id)
         self.flag = f'[{platform}][{self.name}]'
         
-        self.interval = user.get('interval', 10)
+        self.interval = user.get('interval', config.get('interval', 10))
         self.crypto_js_url = user.get('crypto_js_url', '')
         self.headers = user.get('headers', {'User-Agent': 'Chrome'})
         self.cookies = user.get('cookies')
@@ -57,8 +58,8 @@ class LiveRecoder:
         self.mState = 0
         while True:
             try:
-                logger.info(f'{self.flag}正在检测直播状态')
-                logger.info(f'预配置刷新间隔：{self.interval}s')
+                logger.debug(f'{self.flag}正在检测直播状态')
+                logger.debug(f'预配置刷新间隔：{self.interval}s')
                 try:
                     await self.run()   
                 except Exception as run_error:
@@ -67,7 +68,7 @@ class LiveRecoder:
                 timeI = self.interval
                 if state == '1':
                     timeI = 2
-                logger.info(f'->直播状态：{state}  实际刷新间隔：{timeI}s')
+                logger.debug(f'->直播状态：{state}  实际刷新间隔：{timeI}s')
                 await asyncio.sleep(timeI)
             except ConnectionError as error:
                 if '直播检测请求协议错误' not in str(error):
@@ -156,6 +157,43 @@ class LiveRecoder:
 
         # 调用模板处理
         directory, filename = self.render_filename_template(title, format)
+        
+        # 限制文件名长度，保留扩展名
+        max_length = 240  # 留一些余量，避免边界问题
+        name_part, ext_part = os.path.splitext(filename)
+        if len(filename.encode('utf-8')) > max_length:
+            # 计算需要截断的长度，确保截断后的总长度不超过max_length
+            encoded_name = name_part.encode('utf-8')
+            encoded_ext = ext_part.encode('utf-8')
+            # 计算可用于名称部分的最大字节数
+            max_name_bytes = max_length - len(encoded_ext)
+            
+            # 逐字符截断，确保不会截断到UTF-8字符中间
+            truncated_name_bytes = encoded_name[:max_name_bytes]
+            while True:
+                try:
+                    truncated_name = truncated_name_bytes.decode('utf-8')
+                    break
+                except UnicodeDecodeError:
+                    # 如果截断位置不正确，减少一个字节再试
+                    truncated_name_bytes = truncated_name_bytes[:-1]
+            
+            # 创建截断后的文件名
+            truncated_filename = truncated_name + ext_part
+            
+            # 保存完整标题到txt文件
+            full_title_path = os.path.join(directory, truncated_name + '.txt')
+            try:
+                os.makedirs(directory, exist_ok=True)
+                with open(full_title_path, 'w', encoding='utf-8') as f:
+                    f.write(f"完整标题: {title}\n")
+                    f.write(f"录制URL: {self.flag}\n")
+                    f.write(f"录制时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                logger.info(f"{self.flag}标题过长，已截断并保存完整标题到: {full_title_path}")
+            except Exception as e:
+                logger.error(f"{self.flag}保存完整标题失败: {repr(e)}")
+            
+            filename = truncated_filename
 
         # 确保目录存在
         try:
@@ -265,26 +303,26 @@ class LiveRecoder:
         finally:
             output.close()
 
-def run_ffmpeg(self, filename, format):
-    logger.info(f'{self.flag}开始ffmpeg封装：{filename}')
-    directory, file_basename = os.path.split(filename)
-    new_basename = file_basename.replace(f'.{format}', f'.{self.format}')
-    new_filename = os.path.join(directory, new_basename)
+    def run_ffmpeg(self, filename, format):
+        logger.info(f'{self.flag}开始ffmpeg封装：{filename}')
+        directory, file_basename = os.path.split(filename)
+        new_basename = file_basename.replace(f'.{format}', f'.{self.format}')
+        new_filename = os.path.join(directory, new_basename)
 
-    try:
-        ffmpeg.input(filename).output(
-            new_filename,
-            codec='copy',
-            map_metadata='-1',
-            movflags='faststart'
-        ).global_args('-hide_banner').run()
+        try:
+            ffmpeg.input(filename).output(
+                new_filename,
+                codec='copy',
+                map_metadata='-1',
+                movflags='faststart'
+            ).global_args('-hide_banner').run()
 
-        # 确保封装成功后再删除原文件
-        os.remove(filename)
-        logger.info(f'{self.flag}封装完成，原始文件已删除：{filename}')
+            # 确保封装成功后再删除原文件
+            os.remove(filename)
+            logger.info(f'{self.flag}封装完成，原始文件已删除：{filename}')
 
-    except Exception as e:
-        logger.error(f'{self.flag}FFmpeg 处理失败：{filename}\n错误信息：{e}')
+        except Exception as e:
+            logger.error(f'{self.flag}FFmpeg 处理失败：{filename}\n错误信息：{e}')
 
 class Bilibili(LiveRecoder):
     async def run(self):
@@ -412,6 +450,11 @@ class Douyin(LiveRecoder):
 
 
 class Youtube(LiveRecoder):
+    def __init__(self, config: dict, user: dict):
+        super().__init__(config, user)
+        # 添加一个字典来跟踪该频道的所有录制任务
+        self.recording_tasks = {}
+        
     async def run(self):
         response = (await self.request(
             method='POST',
@@ -433,16 +476,64 @@ class Youtube(LiveRecoder):
                 'params': 'EgdzdHJlYW1z8gYECgJ6AA%3D%3D'
             }
         )).json()
+        
+        # 记录当前检测到的所有直播
+        current_lives = set()
+        
         jsonpath = parse('$..videoWithContextRenderer').find(response)
         for match in jsonpath:
             video = match.value
             if '"style": "LIVE"' in json.dumps(video):
                 url = f"https://www.youtube.com/watch?v={video['videoId']}"
+                current_lives.add(url)
                 title = video['headline']['runs'][0]['text']
-                if url not in recording:
+                
+                # 如果直播未在录制中，且未在全局录制列表中，则开始录制
+                if url not in self.recording_tasks and url not in recording:
+                    logger.info(f"{self.flag}检测到新直播: {title}")
                     stream = self.get_streamlink().streams(url).get('best')  # HLSStream[mpegts]
-                    # FIXME:多开直播间中断
-                    asyncio.create_task(asyncio.to_thread(self.run_record, stream, url, title, 'ts'))
+                    
+                    # 创建录制任务并保存引用
+                    task = asyncio.create_task(self.record_stream(stream, url, title))
+                    self.recording_tasks[url] = task
+                    
+                    # 设置任务完成回调，以便在录制结束时清理
+                    task.add_done_callback(lambda t, u=url: self.cleanup_task(u, t))
+        
+        # 检查并清理已经不存在的直播任务
+        for url in list(self.recording_tasks.keys()):
+            if url not in current_lives:
+                # 直播已经结束，但任务仍在运行，取消任务
+                if not self.recording_tasks[url].done():
+                    logger.info(f"{self.flag}直播已结束，取消录制: {url}")
+                    self.recording_tasks[url].cancel()
+                # 清理已完成的任务
+                if self.recording_tasks[url].done():
+                    self.cleanup_task(url, self.recording_tasks[url])
+    
+    def cleanup_task(self, url, task):
+        """清理已完成的录制任务"""
+        try:
+            # 获取任务结果，如果有异常会引发
+            task.result()
+        except asyncio.CancelledError:
+            logger.info(f"{self.flag}录制任务已取消: {url}")
+        except Exception as e:
+            logger.error(f"{self.flag}录制任务异常: {url}, {repr(e)}")
+        
+        # 从任务字典中移除
+        if url in self.recording_tasks:
+            del self.recording_tasks[url]
+    
+    async def record_stream(self, stream, url, title):
+        """异步包装录制流的方法"""
+        try:
+            await asyncio.to_thread(self.run_record, stream, url, title, 'ts')
+        except Exception as e:
+            logger.error(f"{self.flag}录制流异常: {url}, {repr(e)}")
+            # 确保从全局录制列表中移除
+            recording.pop(url, None)
+            raise
 
 
 class Twitch(LiveRecoder):
@@ -627,12 +718,17 @@ async def run():
 
 
 if __name__ == '__main__':
+    # 配置文件日志
     logger.add(
         sink='logs/log_{time:YYYY-MM-DD}.log',
         rotation='00:00',
         retention='3 days',
-        level='INFO',
+        level='DEBUG',  # 文件中保留DEBUG级别的日志
         encoding='utf-8',
         format='[{time:YYYY-MM-DD HH:mm:ss}][{level}][{name}][{function}:{line}]{message}'
     )
+    
+    # 配置控制台日志级别为INFO，这样DEBUG级别的日志不会显示在控制台
+    logger.configure(handlers=[{"sink": sys.stdout, "level": "INFO"}])
+    
     asyncio.run(run())
