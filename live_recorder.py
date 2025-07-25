@@ -2,12 +2,15 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 import uuid
+import pytz
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Dict, Tuple, Union
 from urllib.parse import parse_qs
+from datetime import datetime
 
 import anyio
 import ffmpeg
@@ -23,11 +26,81 @@ from streamlink_cli.main import open_stream
 from streamlink_cli.output import FileOutput
 from streamlink_cli.streamrunner import StreamRunner
 
-import liquid,pytz
-from datetime import datetime
-import sys
-
 recording: Dict[str, Tuple[StreamIO, FileOutput]] = {}
+
+class TemplateEngine:
+    """轻量级模板引擎，替代liquid依赖"""
+    
+    def __init__(self):
+        self.filters = {}
+    
+    def add_filter(self, name, func):
+        """注册过滤器函数"""
+        self.filters[name] = func
+    
+    def from_string(self, template):
+        """创建模板对象"""
+        return Template(template, self)
+
+class Template:
+    """模板类"""
+    
+    def __init__(self, template, engine):
+        self.template = template
+        self.engine = engine
+    
+    def render(self, context):
+        """渲染模板"""
+        # 使用正则表达式找到所有模板变量 {{ ... }}
+        pattern = r'\{\{\s*([^}]+)\s*\}\}'
+        
+        def replace_var(match):
+            expr = match.group(1).strip()
+            return self._evaluate_expression(expr, context)
+        
+        return re.sub(pattern, replace_var, self.template)
+    
+    def _evaluate_expression(self, expr, context):
+        """评估表达式，支持变量和管道过滤器"""
+        # 解析管道过滤器
+        parts = [p.strip() for p in expr.split('|')]
+        var_name = parts[0]
+        
+        # 获取变量值
+        if var_name not in context:
+            raise KeyError(f"Template variable '{var_name}' not found in context")
+        
+        value = context[var_name]
+        
+        # 应用过滤器链
+        for filter_expr in parts[1:]:
+            value = self._apply_filter(filter_expr, value)
+        
+        return str(value)
+    
+    def _apply_filter(self, filter_expr, value):
+        """应用单个过滤器"""
+        # 解析过滤器名称和参数
+        if ':' in filter_expr:
+            filter_name, args_str = filter_expr.split(':', 1)
+            filter_name = filter_name.strip()
+            # 简单的参数解析（处理引号和逗号分隔）
+            args = []
+            for arg in args_str.split(','):
+                arg = arg.strip()
+                # 移除引号
+                if (arg.startswith("'") and arg.endswith("'")) or (arg.startswith('"') and arg.endswith('"')):
+                    arg = arg[1:-1]
+                args.append(arg)
+        else:
+            filter_name = filter_expr.strip()
+            args = []
+        
+        if filter_name not in self.engine.filters:
+            raise ValueError(f"Unknown filter: {filter_name}")
+        
+        return self.engine.filters[filter_name](value, *args)
+
 
 class LiveRecoder:
     def __init__(self, config: dict, user: dict):
@@ -43,13 +116,13 @@ class LiveRecoder:
         self.format = user.get('format', 'flv')
         self.proxy = user.get('proxy', config.get('proxy'))
         self.output = user.get('output', config.get('output', 'output'))
+        self.ssl = True
         if not self.crypto_js_url:
             self.crypto_js_url = 'https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js'
         self.get_cookies()
         self.client = self.get_client()
 
-        # liquid过滤器
-        self.env = liquid.Environment()
+        self.env = TemplateEngine()
         self.env.add_filter('time_zone', self.time_zone)
         self.env.add_filter('format_date', self.format_date)
 
@@ -100,18 +173,18 @@ class LiveRecoder:
 
     def get_client(self):
         client_kwargs = {
-            'http2': True,
-            'timeout': self.interval,
-            'limits': httpx.Limits(max_keepalive_connections=100, keepalive_expiry=self.interval * 2),
+            'timeout': httpx.Timeout(30.0),
             'headers': self.headers,
-            'cookies': self.cookies
+            'cookies': self.cookies,
+            'verify': self.ssl,
+            'follow_redirects': True
         }
-        # 检查是否有设置代理
         if self.proxy:
             if 'socks' in self.proxy:
                 client_kwargs['transport'] = AsyncProxyTransport.from_url(self.proxy)
             else:
-                client_kwargs['proxies'] = self.proxy
+                # 使用 proxy 而不是 proxies, 较新版本的 httpx proxies 参数已被移除
+                client_kwargs['proxy'] = self.proxy
         return httpx.AsyncClient(**client_kwargs)
 
     def get_cookies(self):
@@ -158,31 +231,24 @@ class LiveRecoder:
         # 调用模板处理
         directory, filename = self.render_filename_template(title, format)
         
-        # 限制文件名长度，保留扩展名
-        max_length = 240  # 留一些余量，避免边界问题
+        # 限制文件名长度
+        max_length = 240
         name_part, ext_part = os.path.splitext(filename)
         if len(filename.encode('utf-8')) > max_length:
-            # 计算需要截断的长度，确保截断后的总长度不超过max_length
             encoded_name = name_part.encode('utf-8')
             encoded_ext = ext_part.encode('utf-8')
-            # 计算可用于名称部分的最大字节数
             max_name_bytes = max_length - len(encoded_ext)
-            
-            # 逐字符截断，确保不会截断到UTF-8字符中间
             truncated_name_bytes = encoded_name[:max_name_bytes]
             while True:
                 try:
                     truncated_name = truncated_name_bytes.decode('utf-8')
                     break
                 except UnicodeDecodeError:
-                    # 如果截断位置不正确，减少一个字节再试
                     truncated_name_bytes = truncated_name_bytes[:-1]
             
-            # 创建截断后的文件名
             truncated_filename = truncated_name + ext_part
-            
-            # 保存完整标题到txt文件
             full_title_path = os.path.join(directory, truncated_name + '.txt')
+            
             try:
                 os.makedirs(directory, exist_ok=True)
                 with open(full_title_path, 'w', encoding='utf-8') as f:
@@ -195,7 +261,6 @@ class LiveRecoder:
             
             filename = truncated_filename
 
-        # 确保目录存在
         try:
             if not os.path.exists(directory):
                 os.makedirs(directory)
@@ -226,16 +291,14 @@ class LiveRecoder:
             if "{{" in rendered_output or "}}" in rendered_output:
                 raise ValueError(f"路径中存在未解析的模板变量: {rendered_output}")
 
-            # 分割目录和文件名
             directory, filename = os.path.split(rendered_output)
 
-            # 如果目录为空，使用默认输出路径
             if not directory:
                 directory = "output"
 
             return directory, filename
 
-        except (KeyError, ValueError, liquid.exceptions.TemplateError) as e:
+        except (KeyError, ValueError) as e:
             logger.warning(f"{self.flag}模板渲染失败，使用默认文件名模板。错误信息: {e}")
             return self.default_filename_template(title, format)
 
@@ -253,7 +316,6 @@ class LiveRecoder:
         ssl = self.ssl
         logger.info(f'是否验证SSL：{ssl}')
         session.set_option('http-ssl-verify', ssl)
-        # 添加streamlink的http相关选项
         if proxy := self.proxy:
             # 代理为socks5时，streamlink的代理参数需要改为socks5h，防止部分直播源获取失败
             if 'socks' in proxy:
@@ -288,7 +350,8 @@ class LiveRecoder:
             output.open()
             recording[url] = (stream_fd, output)
             logger.info(f'{self.flag}正在录制：{filename}')
-            StreamRunner(stream_fd, output, show_progress=True).run(prebuffer)
+            # 移除 show_progress 参数，新版本的 Streamlink 会自动处理进度显示，不需要手动指定 show_progress 参数
+            StreamRunner(stream_fd, output).run(prebuffer)
             return True
         except Exception as error:
             if 'timeout' in str(error):
@@ -323,6 +386,7 @@ class LiveRecoder:
 
         except Exception as e:
             logger.error(f'{self.flag}FFmpeg 处理失败：{filename}\n错误信息：{e}')
+
 
 class Bilibili(LiveRecoder):
     async def run(self):
@@ -718,17 +782,15 @@ async def run():
 
 
 if __name__ == '__main__':
-    # 配置文件日志
     logger.add(
         sink='logs/log_{time:YYYY-MM-DD}.log',
         rotation='00:00',
         retention='3 days',
-        level='DEBUG',  # 文件中保留DEBUG级别的日志
+        level='DEBUG',
         encoding='utf-8',
         format='[{time:YYYY-MM-DD HH:mm:ss}][{level}][{name}][{function}:{line}]{message}'
     )
     
-    # 配置控制台日志级别为INFO，这样DEBUG级别的日志不会显示在控制台
     logger.configure(handlers=[{"sink": sys.stdout, "level": "INFO"}])
     
     asyncio.run(run())
