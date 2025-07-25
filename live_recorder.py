@@ -106,6 +106,7 @@ class LiveRecoder:
     def __init__(self, config: dict, user: dict):
         self.id = user['id']
         platform = user['platform']
+        self.platform = platform
         self.name = user.get('name', self.id)
         self.flag = f'[{platform}][{self.name}]'
         
@@ -272,7 +273,7 @@ class LiveRecoder:
     def render_filename_template(self, title, format):
         # 模板参数
         context = {
-            "platform": self.flag,
+            "platform": self.platform,  # 使用纯平台名
             "id": self.id,
             "name": self.name,
             "title": title,
