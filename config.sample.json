@@ -1,13 +1,16 @@
 {
   "proxy": "http://127.0.0.1:7890",
-  "output": "output",
-  // "output": "录播文件/{{ name }}/{{ platform }}/{{ now | time_zone: 'Asia/Shanghai' | format_date: '%Y%m%d-%H%M%S-%f' }}_{{ title }}.{{ format }}",
+  "output": "录播文件/{{ name }}/{{ platform }}/{{ now | time_zone: 'Asia/Shanghai' | format_date: '%Y%m%d-%H%M%S-%f' }}_{{ title }}.{{ format }}",
   "user": [
     {
       "platform": "Bilibili",
       "id": "15152878",
       "name": "鹿乃",
       "interval": 10,
+      "retry": {
+        "max_retries": 3,
+        "retry_interval": 3
+      },
       "format": "mp4",
       "output": "bilibili_鹿乃",
       "proxy": "socks5://127.0.0.1:7890",

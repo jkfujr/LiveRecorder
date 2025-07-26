@@ -1,22 +1,11 @@
-import asyncio
-import json
-import os
-import re
-import sys
-import time
-import uuid
-import pytz
+import asyncio, json, os, re, sys, time, uuid, pytz
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Dict, Tuple, Union
 from urllib.parse import parse_qs
 from datetime import datetime
 
-import anyio
-import ffmpeg
-import httpx
-import jsengine
-import streamlink
+import anyio, ffmpeg, httpx, jsengine, streamlink
 from httpx_socks import AsyncProxyTransport
 from jsonpath_ng.ext import parse
 from loguru import logger
@@ -29,7 +18,7 @@ from streamlink_cli.streamrunner import StreamRunner
 recording: Dict[str, Tuple[StreamIO, FileOutput]] = {}
 
 class TemplateEngine:
-    """轻量级模板引擎，替代liquid依赖"""
+    """轻量模板"""
     
     def __init__(self):
         self.filters = {}
@@ -117,6 +106,12 @@ class LiveRecoder:
         self.format = user.get('format', 'flv')
         self.proxy = user.get('proxy', config.get('proxy'))
         self.output = user.get('output', config.get('output', 'output'))
+        
+        # 重试配置
+        retry_config = config.get('retry', {})
+        self.max_retries = retry_config.get('max_retries', 3)
+        self.retry_interval = retry_config.get('retry_interval', 3)
+        
         self.ssl = True
         if not self.crypto_js_url:
             self.crypto_js_url = 'https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js'
@@ -130,6 +125,8 @@ class LiveRecoder:
     async def start(self):
         self.ssl = True
         self.mState = 0
+        retry_count = 0
+        
         while True:
             try:
                 logger.debug(f'{self.flag}正在检测直播状态')
@@ -138,6 +135,9 @@ class LiveRecoder:
                     await self.run()   
                 except Exception as run_error:
                     logger.error(f"{self.flag}直播检测内部错误\n{repr(run_error)}")
+
+                retry_count = 0
+                
                 state = self.mState
                 timeI = self.interval
                 if state == '1':
@@ -147,8 +147,21 @@ class LiveRecoder:
             except ConnectionError as error:
                 if '直播检测请求协议错误' not in str(error):
                     logger.error(error)
-                await self.client.aclose()
-                self.client = self.get_client()
+                
+                retry_count += 1
+                if retry_count <= self.max_retries:
+                    logger.info(f'{self.flag}网络错误，正在进行第{retry_count}/{self.max_retries}次重试...')
+                    await self.client.aclose()
+                    self.client = self.get_client()
+                    await asyncio.sleep(self.retry_interval)
+                    continue
+                else:
+                    logger.error(f'{self.flag}网络错误重试{self.max_retries}次失败，等待下次检测间隔')
+                    retry_count = 0  # 重置计数器
+                    await self.client.aclose()
+                    self.client = self.get_client()
+                    await asyncio.sleep(self.interval)
+                    continue
             except Exception as error:
                 logger.exception(f'{self.flag}直播检测错误\n{repr(error)}')
 
@@ -167,7 +180,7 @@ class LiveRecoder:
         except anyio.EndOfStream as error:
             raise ConnectionError(f'{self.flag}直播检测代理错误\n{error}')
         except httpx.HTTPError as error:
-           logger.error(f'网络异常 重试...')
+           logger.error(f'网络请求失败，准备重试: {type(error).__name__}: {error}')
            raise ConnectionError(f'{self.flag}直播检测请求错误\n{repr(error)}')
 		
            
