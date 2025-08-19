@@ -14,13 +14,7 @@ jobs:
   build:
     strategy:
       matrix:
-        include:
-          - os: windows-latest
-            static_tag: ""
-          - os: macos-latest
-            static_tag: ""
-          - os: ubuntu-latest
-            static_tag: "_Static"
+        os: [ windows-latest, macos-latest, ubuntu-latest ]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
@@ -42,23 +36,10 @@ jobs:
           pyinstaller build.spec
           cp config.sample.json dist/
 
-      - name: Install staticx (Ubuntu only)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          pip install staticx
-          sudo apt-get update
-          sudo apt-get install -y patchelf
-
-      - name: Create static binary (Ubuntu only)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          staticx dist/LiveRecorder dist/LiveRecorder-static
-          mv dist/LiveRecorder-static dist/LiveRecorder
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LiveRecorder_${{ runner.os }}${{ matrix.static_tag }}_${{ github.ref_name }}
+          name: LiveRecorder_${{ runner.os }}_${{ github.ref_name }}
           path: dist/
           compression-level: 6
           retention-days: 90
@@ -67,7 +48,7 @@ jobs:
         if: startsWith(github.ref_name, 'v')
         uses: thedoctor0/zip-release@main
         with:
-          filename: LiveRecorder_${{ runner.os }}${{ matrix.static_tag }}_${{ github.ref_name }}.zip
+          filename: LiveRecorder_${{ runner.os }}_${{ github.ref_name }}.zip
           directory: dist/
           path: |
             LiveRecorder*
