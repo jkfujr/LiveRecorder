@@ -1,4 +1,4 @@
-import asyncio, json, os, re, sys, time, uuid, pytz
+import asyncio, json, os, re, sys, time, uuid, pytz, logging
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Dict, Tuple, Union
@@ -16,6 +16,33 @@ from streamlink_cli.output import FileOutput
 from streamlink_cli.streamrunner import StreamRunner
 
 recording: Dict[str, Tuple[StreamIO, FileOutput]] = {}
+
+def setup_logging():
+    """日志模块"""
+    os.makedirs('logs', exist_ok=True)
+    
+    # 隐藏 twitcasting 在未直播中提示没有流的信息
+    logging.getLogger('streamlink.plugins.twitcasting').setLevel(logging.CRITICAL)
+    logger.remove()
+    
+    # 日志文件
+    log_filename = f'logs/log_{datetime.now().strftime("%Y-%m-%d")}.log'
+    
+    # 文件日志
+    logger.add(
+        sink=log_filename,
+        level='DEBUG',
+        encoding='utf-8',
+        format='[{time:YYYY-MM-DD HH:mm:ss}][{level}][{name}][{function}:{line}]{message}'
+    )
+    
+    # 控制台日志
+    logger.add(
+        sink=sys.stderr,
+        level='INFO',
+        format='[{time:YYYY-MM-DD HH:mm:ss}][{level}][{name}][{function}:{line}]{message}',
+        colorize=True
+    )
 
 class TemplateEngine:
     """轻量模板"""
@@ -127,10 +154,12 @@ class LiveRecoder:
         self.mState = 0
         retry_count = 0
         
+        logger.info(f'{self.flag}初始化完成，开始监控循环')
+        
         while True:
             try:
                 logger.debug(f'{self.flag}正在检测直播状态')
-                logger.debug(f'预配置刷新间隔：{self.interval}s')
+                logger.debug(f'{self.flag}预配置刷新间隔：{self.interval}s')
                 try:
                     await self.run()   
                 except Exception as run_error:
@@ -142,7 +171,7 @@ class LiveRecoder:
                 timeI = self.interval
                 if state == '1':
                     timeI = 2
-                logger.debug(f'->直播状态：{state}  实际刷新间隔：{timeI}s')
+                logger.debug(f'{self.flag}->直播状态：{state}  实际刷新间隔：{timeI}s')
                 await asyncio.sleep(timeI)
             except ConnectionError as error:
                 if '直播检测请求协议错误' not in str(error):
@@ -680,8 +709,16 @@ class Twitcasting(LiveRecoder):
                     url=url
                 )).text
                 title = re.search('<meta name="twitter:title" content="(.*?)">', response).group(1)
-                stream = self.get_streamlink().streams(url).get('best')  # Stream[mp4]
-                await asyncio.to_thread(self.run_record, stream, url, title, 'mp4')
+                try:
+                    # 检查是否有可用流
+                    temp_session = streamlink.Streamlink()
+                    available_streams = temp_session.streams(url)
+                    if available_streams:
+                        # 有流时才完整调用
+                        stream = self.get_streamlink().streams(url).get('best')  # Stream[mp4]
+                        await asyncio.to_thread(self.run_record, stream, url, title, 'mp4')
+                except Exception as e:
+                    logger.debug(f'{self.flag}流检测失败：{e}')
 
 
 class Afreeca(LiveRecoder):
@@ -786,12 +823,24 @@ class Chaturbate(LiveRecoder):
 async def run():
     with open('config.json', 'r', encoding='utf-8') as f:
         config = json.load(f)
+    
+    logger.debug(f'配置文件加载完成，共配置 {len(config["user"])} 个用户')
+    logger.debug(f'全局配置: interval={config.get("interval", 10)}s, output={config.get("output", "output")}')
+    
+    for i, user in enumerate(config['user'], 1):
+        logger.debug(f'用户{i}: [{user["platform"]}][{user.get("name", user["id"])}] ID={user["id"]} interval={user.get("interval", config.get("interval", 10))}s')
+    
     try:
         tasks = []
+        active_users = []
         for item in config['user']:
             platform_class = globals()[item['platform']]
+            user_info = f'[{item["platform"]}][{item.get("name", item["id"])}]'
+            active_users.append(user_info)
             coro = platform_class(config, item).start()
             tasks.append(asyncio.create_task(coro))
+        
+        logger.debug(f'开始轮询 {len(active_users)} 个用户: {", ".join(active_users)}')
         await asyncio.wait(tasks)
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         logger.warning('用户中断录制，正在关闭直播流')
@@ -801,15 +850,5 @@ async def run():
 
 
 if __name__ == '__main__':
-    logger.add(
-        sink='logs/log_{time:YYYY-MM-DD}.log',
-        rotation='00:00',
-        retention='3 days',
-        level='DEBUG',
-        encoding='utf-8',
-        format='[{time:YYYY-MM-DD HH:mm:ss}][{level}][{name}][{function}:{line}]{message}'
-    )
-    
-    logger.configure(handlers=[{"sink": sys.stdout, "level": "INFO"}])
-    
+    setup_logging()
     asyncio.run(run())
