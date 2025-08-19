@@ -305,10 +305,14 @@ class LiveRecoder:
             if "{{" in rendered_output or "}}" in rendered_output:
                 raise ValueError(f"路径中存在未解析的模板变量: {rendered_output}")
 
-            directory, filename = os.path.split(rendered_output)
+            # 路径规范化确保兼容性
+            normalized_output = os.path.normpath(rendered_output)
+            directory, filename = os.path.split(normalized_output)
 
             if not directory:
                 directory = "output"
+            
+            directory = os.path.normpath(directory)
 
             return directory, filename
 
@@ -320,6 +324,7 @@ class LiveRecoder:
         live_time = time.strftime('%Y.%m.%d %H.%M.%S')
         filename = f'[{live_time}]{self.flag}{title[:50]}.{format}'
         directory = self.output or 'output'
+        directory = os.path.normpath(directory)
         return directory, filename
 
     def get_streamlink(self):
