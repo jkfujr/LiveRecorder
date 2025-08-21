@@ -158,8 +158,6 @@ class LiveRecoder:
         
         while True:
             try:
-                logger.debug(f'{self.flag}正在检测直播状态')
-                logger.debug(f'{self.flag}预配置刷新间隔：{self.interval}s')
                 try:
                     await self.run()   
                 except Exception as run_error:
@@ -171,7 +169,7 @@ class LiveRecoder:
                 timeI = self.interval
                 if state == '1':
                     timeI = 2
-                logger.debug(f'{self.flag}->直播状态：{state}  实际刷新间隔：{timeI}s')
+                logger.debug(f'{self.flag}检测完成 - 状态:{state} 配置间隔:{self.interval}s 实际间隔:{timeI}s')
                 await asyncio.sleep(timeI)
             except ConnectionError as error:
                 if '直播检测请求协议错误' not in str(error):
